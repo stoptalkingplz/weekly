@@ -985,7 +985,7 @@ def build_weekly_timeline_state(weekly_atomic_pool):
     }
 
 
-def compact_timeline_state_for_llm(batch_state, max_text_len_per_tree=2000):
+def compact_timeline_state_for_llm(batch_state, max_text_len_per_tree=10000):
     compact = {
         "platform": batch_state.get("platform"),
         "projects": []
