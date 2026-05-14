@@ -893,7 +893,16 @@ def llm_extract_items_from_person_blocks(person_blocks, project):
     batches = list(split_list_into_batches(person_blocks, batch_size))
     for idx, batch in enumerate(batches, 1):
         print(f"    [Extract][{project.get('project_name', '')}] person_blocks batch {idx}/{len(batches)}, size={len(batch)}")
-        prompt_text = prompt_template.replace("{{person_blocks_json}}", json.dumps(batch, ensure_ascii=False, indent=2))
+        platforms = project.get("platforms") or project.get("platform") or []
+        if isinstance(platforms, str):
+            platforms = [platforms]
+        prompt_text = (
+            prompt_template
+            .replace("{{project_name}}", project.get("project_name", ""))
+            .replace("{{dept_name}}", project.get("dept_name", ""))
+            .replace("{{platforms_json}}", json.dumps(platforms, ensure_ascii=False))
+            .replace("{{person_blocks_json}}", json.dumps(batch, ensure_ascii=False, indent=2))
+        )
         result = call_llm(
             messages=[
                 {"role": "system", "content": "你是项目日报结构化抽取助手，只输出合法 JSON。"},
@@ -1891,9 +1900,86 @@ def send_message_api(receiver_guids, title, content, sender_guid="", interactive
     )
 
 
-def build_simple_weekly_card(title, note_url, final_markdown):
-    """简化版互动卡片：只做周报通知入口，不做单独卡片总结。"""
-    preview = re.sub(r"\n{2,}", "\n", strip_markdown_wrapper(final_markdown))[:1200]
+def get_default_card_prompt():
+    return """# Role
+你是一位资深项目经理助手，专门将完整项目周报压缩为适合飞书卡片展示的短摘要。
+
+# Task
+你会收到一份完整项目周报 Markdown。你的任务是将其改写为适合飞书卡片展示的精简摘要。
+
+# Input
+{{weekly_markdown}}
+
+# Output
+只输出 Markdown 文本，不要输出代码块，不要输出解释，不要输出 JSON。
+
+# 最高优先级原则
+1. 绝对匿名：删除所有人名、普通 @姓名、以及 `[@姓名](mention:uid:id)` mention。
+2. 使用无主语句，例如“完成 XX 验证”“推进 XX 联调”“识别 XX 风险”。
+3. 卡片适配：短句、少层级、每条 bullet 尽量一行。
+4. 覆盖核心，不求全量：优先保留关键完成事项、关键里程碑、明确量化结果、关键风险、下周重点计划。
+5. 不得编造周报中不存在的事实、风险、数量、项目名或平台名。
+6. 如果完整周报中出现明确数字，卡片中应尽量保留。
+
+# 推荐输出结构
+请严格使用以下结构：
+
+### 📌 本周亮点
+- ...
+
+### ⚠️ 风险 / 需关注
+- ...
+
+### 📝 下周重点
+- ...
+
+# 约束
+1. 本周亮点最多 5 条。
+2. 风险 / 需关注最多 3 条；如果无明确风险，输出“- 暂无明确阻塞性风险”。
+3. 下周重点最多 4 条。
+4. 不要输出日期范围、源日报链接、source_item_ids、evidence_dates。
+5. 不要保留任何人名或 mention。
+"""
+
+
+def generate_card_content(project, weekly_markdown):
+    """使用 weekly_card_prompt_file_guid 将完整周报压缩为飞书卡片摘要。"""
+    prompt_template = get_prompt_text(project, "weekly_card_prompt_file_guid", get_default_card_prompt())
+    prompt_text = (
+        prompt_template
+        .replace("{{weekly_markdown}}", weekly_markdown)
+        # 兼容旧版原子池卡片 prompt 的占位符
+        .replace("{{markdown_content}}", weekly_markdown)
+    )
+    try:
+        result = call_llm(
+            messages=[
+                {"role": "system", "content": "你是飞书卡片摘要助手，请输出匿名、简洁、适合卡片展示的 Markdown。"},
+                {"role": "user", "content": prompt_text},
+            ],
+            max_tokens=int(get_weekly_config(project, "weekly_card_max_tokens", 2048)),
+            temperature=float(get_weekly_config(project, "weekly_card_temperature", 0.2)),
+            stream=True,
+            max_retries=int(get_weekly_config(project, "llm_max_retries", LLM_MAX_RETRIES)),
+        )
+        cleaned = strip_markdown_wrapper(result)
+        return cleaned or fallback_card_content(weekly_markdown)
+    except Exception as e:
+        print(f"    ⚠️ 飞书卡片摘要生成失败，使用兜底摘要: {e}")
+        return fallback_card_content(weekly_markdown)
+
+
+def fallback_card_content(weekly_markdown, max_len=1200):
+    """兜底：不调用模型时的卡片正文。注意：无法严格匿名，仅用于模型失败兜底。"""
+    content = strip_markdown_wrapper(weekly_markdown)
+    # 尽量移除 mention markdown，避免卡片暴露人员信息
+    content = re.sub(r"\[@[^\]]+\]\(mention:[^)]+\)", "", content)
+    content = re.sub(r"@[^\s，。；、:：)）]+", "", content)
+    content = re.sub(r"\n{2,}", "\n", content).strip()
+    return content[:max_len] + ("\n..." if len(content) > max_len else "")
+
+
+def build_feishu_card(title, note_url, card_summary):
     return {
         "schema": "2.0",
         "header": {
@@ -1902,7 +1988,7 @@ def build_simple_weekly_card(title, note_url, final_markdown):
         },
         "body": {
             "elements": [
-                {"tag": "markdown", "content": preview},
+                {"tag": "markdown", "content": card_summary},
                 {
                     "tag": "button",
                     "type": "primary_filled",
@@ -1932,7 +2018,9 @@ def send_weekly_messages(note_url, note_title, project, final_markdown):
         if not webhook_urls and not receiver_guids:
             return
 
-        card = build_simple_weekly_card(note_title, note_url, final_markdown)
+        card_summary = generate_card_content(project, final_markdown)
+        card = build_feishu_card(note_title, note_url, card_summary)
+
         if webhook_urls:
             for webhook_url in webhook_urls:
                 try:
