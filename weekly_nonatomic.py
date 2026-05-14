@@ -2128,23 +2128,20 @@ def process_weekly_project(project):
 
 
 # =============================================================================
-# 主入口
+# 云端平台入口：直接顺序执行，不使用 main()
 # =============================================================================
-def main():
-    if not projects:
-        raise ValueError("config.projects 不能为空")
+if not projects:
+    raise ValueError("config.projects 不能为空")
 
-    success = 0
-    failed = 0
-    for project in projects:
-        ok = process_weekly_project(project)
-        if ok:
-            success += 1
-        else:
-            failed += 1
+success = 0
+failed = 0
+for project in projects:
+    ok = process_weekly_project(project)
+    if ok:
+        success += 1
+    else:
+        failed += 1
 
-    print("=" * 80)
-    print(f"📌 非原子池周报任务完成：success={success}, failed={failed}")
+print("=" * 80)
+print(f"📌 非原子池周报任务完成：success={success}, failed={failed}")
 
-
-main()
