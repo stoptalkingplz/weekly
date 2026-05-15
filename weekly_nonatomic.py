@@ -252,19 +252,42 @@ def strip_markdown_wrapper(content):
     return content.strip()
 
 
+def repair_common_json_issues(text):
+    text = strip_markdown_wrapper(text)
+
+    # 中文符号修复
+    text = text.replace("“", '"').replace("”", '"')
+    text = text.replace("‘", "'").replace("’", "'")
+
+    # 去掉尾逗号
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+
+    return text.strip()
+
+
 def safe_json_loads(text):
-    clean_text = strip_markdown_wrapper(text)
+    clean_text = repair_common_json_issues(text)
+
+    # 第一轮：直接解析
     try:
         return json.loads(clean_text)
     except Exception:
         pass
 
-    object_match = re.search(r"(\{.*\})", clean_text, flags=re.DOTALL)
-    if object_match:
-        return json.loads(object_match.group(1))
-    array_match = re.search(r"(\[.*\])", clean_text, flags=re.DOTALL)
-    if array_match:
-        return json.loads(array_match.group(1))
+    # 第二轮：尝试从任意位置提取 JSON
+    decoder = json.JSONDecoder()
+
+    for i, ch in enumerate(clean_text):
+        if ch in "{[":
+            try:
+                obj, end = decoder.raw_decode(clean_text[i:])
+                return obj
+            except Exception:
+                continue
+
+    print("❌ JSON 解析失败，原始内容前5000字符：")
+    print(clean_text[:5000])
+
     raise ValueError("无法解析 JSON")
 
 
@@ -356,7 +379,8 @@ def build_weekly_note_title(week_info, project_name):
 
 
 def build_intermediate_json_file(project_guid, target_date_str, json_content, suffix=""):
-    tmp_dir = tempfile.gettempdir()
+    tmp_dir = os.path.join(os.getcwd(), "weekly_debug")
+    os.makedirs(tmp_dir, exist_ok=True)
     unique_suffix = uuid.uuid4().hex[:8]
     name_suffix = f"_{suffix}" if suffix else ""
     file_name = f"weekly_raw_{project_guid}_{target_date_str.replace('-', '')}{name_suffix}_{unique_suffix}.json"
@@ -367,7 +391,8 @@ def build_intermediate_json_file(project_guid, target_date_str, json_content, su
 
 
 def build_intermediate_markdown_file(project_guid, target_date_str, markdown_content, suffix=""):
-    tmp_dir = tempfile.gettempdir()
+    tmp_dir = os.path.join(os.getcwd(), "weekly_debug")
+    os.makedirs(tmp_dir, exist_ok=True)
     unique_suffix = uuid.uuid4().hex[:8]
     name_suffix = f"_{suffix}" if suffix else ""
     file_name = f"weekly_raw_{project_guid}_{target_date_str.replace('-', '')}{name_suffix}_{unique_suffix}.md"
@@ -886,7 +911,7 @@ def llm_extract_items_from_person_blocks(person_blocks, project):
     if not person_blocks:
         return []
 
-    batch_size = int(get_weekly_config(project, "extract_batch_size", 20))
+    batch_size = int(get_weekly_config(project, "extract_batch_size", 5))
     prompt_template = get_prompt_text(project, "weekly_extract_prompt_file_guid", get_default_extract_items_prompt())
     all_items = []
 
@@ -908,13 +933,39 @@ def llm_extract_items_from_person_blocks(person_blocks, project):
                 {"role": "system", "content": "你是项目日报结构化抽取助手，只输出合法 JSON。"},
                 {"role": "user", "content": prompt_text},
             ],
-            max_tokens=int(get_weekly_config(project, "weekly_extract_max_tokens", LLM_MAX_TOKENS)),
+            max_tokens=min(
+                int(get_weekly_config(project, "weekly_extract_max_tokens", 3000)),
+                3000
+            ),
             temperature=float(get_weekly_config(project, "weekly_extract_temperature", 0.0)),
             stream=True,
             max_retries=int(get_weekly_config(project, "llm_max_retries", LLM_MAX_RETRIES)),
         )
-        parsed = safe_json_loads(result)
-        items = parsed.get("items", []) if isinstance(parsed, dict) else parsed
+        try:
+            parsed = safe_json_loads(result)
+        except Exception as e:
+            print("❌ LLM 原始输出如下：")
+            print(result[:20000])
+            raise
+        if isinstance(parsed, dict):
+            # 标准格式
+            if "items" in parsed:
+                items = parsed.get("items", [])
+
+            # 单 item 格式
+            elif "content" in parsed and "section" in parsed:
+                items = [parsed]
+
+            else:
+                items = []
+
+        elif isinstance(parsed, list):
+            items = parsed
+
+        else:
+            items = []
+        print("===== LLM 抽取结果 =====")
+        print(json.dumps(parsed, ensure_ascii=False, indent=2)[:10000])
         if not isinstance(items, list):
             raise ValueError("结构化抽取结果不是 items list")
 
@@ -1801,80 +1852,143 @@ def build_final_markdown(weekly_pool, platform_map, project=None):
 # =============================================================================
 # 笔记创建、写入、消息推送
 # =============================================================================
-def insert_markdown_to_note(user_guid, note_guid, markdown_content, max_retries=3):
-    clean_content = strip_markdown_wrapper(markdown_content)
-    html_content = _convert_special_nodes(clean_content)
-    response = _request_with_retry(
-        "post",
-        BASE_URL + MD_INSERT_ROUTE,
-        max_retries=max_retries,
-        headers=get_headers_with_ak(user_guid=user_guid, doc_id=note_guid),
-        json={
-            "docId": note_guid,
-            "markdown": html_content,
-        },
-        timeout=60,
-    )
-    try:
-        return response.json()
-    except Exception:
-        return {"code": response.status_code, "text": response.text[:500]}
+def create_note_api(content, title, project_guid, parent_guid, tags, creator_guid=None):
+    creator_guid = creator_guid or USER_GUID
 
+    headers = get_headers_with_ak()
+    headers["X-User-GUID"] = creator_guid
 
-def create_workspace_note(user_guid, project_guid, parent_guid, title):
-    """
-    创建周报文档。不同平台环境 save 接口字段可能不同；若你已有固定字段，请只改这里。
-    """
-    payload = {
-        "projectGuid": project_guid,
-        "parentGuid": parent_guid,
-        "title": title,
-        "type": 0,
-    }
+    if not project_guid:
+        raise ValueError("target_project_guid 不能为空！")
+
     response = _request_with_retry(
         "post",
         BASE_URL + WORKSPACE_SAVE_ROUTE,
         max_retries=3,
+        headers=headers,
+        json={
+            "project_guid": project_guid,
+            "parent_guid": parent_guid,
+            "target": {
+                "name": title,
+                "type": 1,
+                "tags": tags
+            },
+            "creator_guid": creator_guid
+        },
+        timeout=60
+    )
+
+    response_json = response.json()
+
+    if response.status_code != 200 or not response_json.get("data"):
+        raise Exception(f"创建笔记 API 返回错误: {response_json}")
+
+    doc_id = response_json.get("data", {}).get("guid")
+
+    if doc_id and content:
+        try:
+            insert_markdown_to_note(
+                creator_guid,
+                doc_id,
+                content,
+                max_retries=5
+            )
+
+        except Exception as e:
+            print(f"    ⚠️ 笔记已创建(doc_id={doc_id})但内容写入失败: {e}")
+            print("    → 将在 5s 后单独重试写入...")
+
+            time.sleep(5)
+
+            try:
+                insert_markdown_to_note(
+                    creator_guid,
+                    doc_id,
+                    content,
+                    max_retries=5
+                )
+                print("    ✅ 重试写入成功")
+
+            except Exception as e2:
+                print(f"    ❌ 重试写入仍失败: {e2}")
+
+    return doc_id
+
+def create_final_weekly_note(content, project, week_info):
+    try:
+        project_name = project.get("project_name", "")
+
+        target_project_guid = project.get("weekly_target_project_guid")
+
+        target_parent_guid = (
+            project.get("weekly_target_folder_guid")
+            or project.get("weekly_target_parent_guid")
+            or "0"
+        )
+
+        target_user_guid = (
+            project.get("weekly_target_user_guid")
+            or USER_GUID
+        )
+
+        if not target_project_guid:
+            raise ValueError(
+                f"配置错误: project '{project_name}' 的 weekly_target_project_guid 为空！"
+            )
+
+        print(f"[Step 7][{project_name}] 正在创建正式周报笔记...")
+
+        title = build_weekly_note_title(
+            week_info,
+            project_name
+        )
+
+        doc_id = create_note_api(
+            content=content,
+            title=title,
+            project_guid=target_project_guid,
+            parent_guid=target_parent_guid,
+            tags=["周报", "AI", "PM日报"],
+            creator_guid=target_user_guid
+        )
+
+        if not doc_id:
+            return [], []
+
+        note_url = f"{BASE_URL}/workspace/{doc_id}"
+
+        print(f"[Step 7][{project_name}] ✅ 正式周报笔记创建完成: {note_url}")
+
+        return [note_url], [title]
+
+    except Exception as e:
+        print(f"[Step 7] ❌ 创建正式周报失败: {e}")
+        traceback.print_exc()
+        return [], []
+
+def insert_markdown_to_note(user_guid, note_guid, markdown_content, max_retries=3):
+    clean_content = strip_markdown_wrapper(markdown_content)
+    html_content = _convert_special_nodes(clean_content)
+
+    response = _request_with_retry(
+        "post",
+        BASE_URL + MD_INSERT_ROUTE,
+        max_retries=max_retries,
         headers=get_headers_with_ak(user_guid=user_guid),
-        json=payload,
-        timeout=60,
+        json={
+            "note_guid": note_guid,
+            "markdown_content": html_content,
+            "mode": "w",
+            "location": 1
+        },
+        timeout=60
     )
-    result = response.json()
-    data = result.get("data") or {}
-    note_guid = data.get("guid") or data.get("docId") or data.get("dataGuid") or data.get("categoryGuid")
-    if not note_guid:
-        raise Exception(f"创建周报文档失败或无法识别 note_guid: {result}")
-    return note_guid, result
 
+    if response.status_code != 200:
+        raise Exception(f"写入笔记失败: {response.text}")
 
-def get_or_create_weekly_note(project, week_info):
-    project_name = project.get("project_name", "Unknown")
-    title = build_weekly_note_title(week_info, project_name)
-    user_guid = project.get("weekly_target_user_guid") or project.get("user_guid") or project.get("leader_guid") or USER_GUID
-
-    # 优先直接写入指定 weekly_note_guid。
-    if project.get("weekly_note_guid"):
-        return project["weekly_note_guid"], title, f"{BASE_URL}/workspace/{project['weekly_note_guid']}"
-
-    target_project_guid = (
-        project.get("weekly_target_project_guid")
-        # 兼容旧字段，建议新配置统一使用 weekly_target_project_guid
-        or project.get("weekly_output_project_guid")
-        or project.get("output_project_guid")
-        or project.get("project_guid")
-    )
-    target_folder_guid = (
-        project.get("weekly_target_folder_guid")
-        # 兼容旧字段，建议新配置统一使用 weekly_target_folder_guid
-        or project.get("weekly_output_folder_guid")
-        or project.get("weekly_parent_guid")
-        or project.get("output_parent_guid")
-    )
-    if not target_project_guid or not target_folder_guid:
-        raise ValueError("未配置 weekly_note_guid，且缺少 weekly_target_project_guid / weekly_target_folder_guid，无法创建周报")
-
-    note_guid, _ = create_workspace_note(user_guid, target_project_guid, target_folder_guid, title)
-    return note_guid, title, f"{BASE_URL}/workspace/{note_guid}"
+    return response.json()
 
 
 def build_message_text(note_title, note_url):
@@ -2107,11 +2221,23 @@ def process_weekly_project(project):
 
         should_write_back = bool(get_weekly_config(project, "write_back", True))
         if should_write_back:
-            note_guid, note_title, note_url = get_or_create_weekly_note(project, week_info)
-            user_guid = project.get("weekly_target_user_guid") or project.get("user_guid") or project.get("leader_guid") or USER_GUID
-            insert_result = insert_markdown_to_note(user_guid=user_guid, note_guid=note_guid, markdown_content=final_markdown)
-            print(f"[Step 7][{project_name}] ✅ 周报写入完成: {note_url}, result={insert_result}")
-            send_weekly_messages(note_url, note_title, project, final_markdown)
+            note_urls, note_titles = create_final_weekly_note(
+                final_markdown,
+                project,
+                week_info
+            )
+
+            if not note_urls:
+                raise Exception("周报创建失败")
+
+            print(f"[Step 7][{project_name}] ✅ 周报创建完成: {note_urls[0]}")
+
+            send_weekly_messages(
+                note_urls[0],
+                note_titles[0],
+                project,
+                final_markdown
+            )
         else:
             print(f"[Step 7][{project_name}] write_back=false，仅生成本地临时文件")
 
@@ -2144,4 +2270,3 @@ for project in projects:
 
 print("=" * 80)
 print(f"📌 非原子池周报任务完成：success={success}, failed={failed}")
-
